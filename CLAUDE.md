@@ -4,23 +4,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**dum dictation** — a local, private, on-device dictation tool for macOS (Apple Silicon, Python
-3.12). A live mic stream becomes corrected text typed into whatever app is focused. The whole point
-is getting technical vocab right (`git`, `kubectl`, `nginx`, `PostgreSQL`) where normal dictation
-hears "get hub" or "engine x". No cloud, no network — everything runs on the machine.
+**dum dictation** — a local, private, on-device dictation tool (Python 3.12). A live mic stream
+becomes corrected text typed into whatever app is focused. The whole point is getting technical
+vocab right (`git`, `kubectl`, `nginx`, `PostgreSQL`) where normal dictation hears "get hub" or
+"engine x". No cloud, no network — everything runs on the machine.
 
-> Platform note: this runs only on macOS/Apple Silicon (Quartz/AppKit keystrokes, MLX LLM). This
-> dev checkout is on Linux/WSL, so `./setup` and `./dum` won't run here — but the **unit suites are
-> pure logic and do run anywhere** once deps are installed. The bench needs local corpus audio.
+> Platform note: OS-specific behaviour is isolated behind `platform_io.py`. **macOS** (Quartz/AppKit
+> + the MLX homophone LLM) and **Windows** (SendInput/win32clipboard/winsound, no LLM) are
+> implemented; **Linux** runs via the degraded `FallbackPlatform` until a native one lands. This dev
+> checkout is Linux/WSL, so `./setup`/`./dum` and the Mac/Windows-native paths can't run here — but
+> the **unit suites are pure logic and run anywhere**, and they cover the cross-platform decomposable
+> parts of every OS backend. The bench needs local corpus audio.
 
 ## Commands
 
 ```sh
-./setup                   # one-time: venv + pinned deps + download Parakeet model + pre-pull LLM
-./dum                     # run the daily driver (double-tap LEFT ⌘ to start/stop; Ctrl+C quits)
-./dum --tray              # same, but as a menu-bar app (icon + Start/Stop/Quit, no babysat terminal)
+# macOS / Linux (bash):
+./setup                   # one-time: venv + pinned deps + Parakeet model (+ LLM pre-pull on macOS only)
+./dum                     # run the daily driver (mac: double-tap LEFT ⌘; linux: double-tap RIGHT Ctrl)
+./dum --tray              # same, but as a menu-bar/tray app (icon + Start/Stop/Quit, no babysat terminal)
 ./dum --config            # re-run the first-run mic/hotkey wizard
-./dum --install-autostart # launchd login item (auto-start + relaunch-on-crash); --uninstall-autostart / --autostart-status
+./dum --install-autostart # login item (auto-start + relaunch-on-crash); --uninstall-autostart / --autostart-status
+
+# Windows (PowerShell) — same flags, mirror scripts:
+.\setup.ps1               # venv + deps (pywin32; MLX/pyobjc skipped via markers) + Parakeet model
+.\dum.ps1                 # daily driver (double-tap RIGHT Ctrl; no --llm — MLX is Apple-Silicon only)
+.\dum.ps1 --tray          # tray app via pythonw (no console window)
 
 scripts/test              # THE DEV GATE — unit suites + bench vs baseline; must print "ALL GREEN"
 scripts/test --realtime   # also replay the corpus at true mic cadence (real settle latency)
@@ -72,29 +81,38 @@ Flow: **capture → VAD → recognize → correct → insert**, single-consumer 
   (backspace + retype) on pause — used in editors/terminals. **Paste** finalizes at commit via the
   clipboard — used for rich-text surfaces that scramble under synthetic keystrokes. `live.py` picks
   per focused app (overlay by default; a small block list routes to paste).
-- **`src/platform_io.py`** — all macOS-native bits: Quartz CGEvent keystrokes, AppKit NSPasteboard,
-  Accessibility reads, focused-app detection.
+- **`src/platform_io.py`** — the OS seam, one class per platform behind `get_platform()`.
+  `MacPlatform` (Quartz CGEvent keystrokes, AppKit NSPasteboard, AX reads), `WindowsPlatform`
+  (ctypes SendInput Unicode typing, win32clipboard save/restore, winsound, GetForegroundWindow),
+  `FallbackPlatform` (pynput typing, used on Linux). Both native backends override `type_text` with
+  raw-Unicode insertion so a dead-key layout (e.g. Slovak) isn't mangled. The hotkey listener +
+  overlay backspaces ride on pynput (cross-platform) everywhere.
 
 ### Robust launch (menu bar + auto-start + single-instance)
 
 The "feels like a real app, no babysat terminal" layer — added in the cross-platform port work,
 behind thin OS seams (same philosophy as `platform_io.py`):
 
-- **`src/single_instance.py`** — an exclusive `fcntl.flock` on `~/.dum/dum.lock`; a second live copy
-  exits with `AlreadyRunning`. Acquired in `live.py` for the live daily-driver modes only (NOT
-  `--replay`/`--list-devices`/bench), so the test gate is unaffected. Guards the single-owner
-  resources: mic, global hotkey (two pynput listeners can get the process OS-aborted), and overlay.
-- **`src/tray.py`** — `pystray` menu-bar/tray front-end. **The tray owns the main thread** (required
-  for the macOS GUI run loop); the pynput hotkey listener + recognizer stay on background threads. A
-  watcher thread mirrors `app.running` onto the icon, so the double-tap hotkey and the menu reflect
-  the same state. `TrayController` is the GUI-free, unit-tested glue; pystray/pillow imports are lazy.
-- **`src/autostart.py`** — login-item installer. macOS = a launchd LaunchAgent
-  (`sk.zaprazny.dum.plist`) with `RunAtLoad` + `KeepAlive={SuccessfulExit:false}` (relaunch on crash,
-  honor a clean Quit). Windows (Task Scheduler) / Linux (`systemd --user`) land behind the same
-  `install()`/`uninstall()`/`status()` interface in later phases. `build_plist_dict` is pure/tested.
+- **`src/single_instance.py`** — an exclusive lock on `~/.dum/dum.lock` (`fcntl.flock` on macOS/Linux,
+  `msvcrt.locking` on Windows, behind one interface); a second live copy exits with `AlreadyRunning`.
+  Acquired in `live.py` for the live daily-driver modes only (NOT `--replay`/`--list-devices`/bench),
+  so the test gate is unaffected. Guards the single-owner resources: mic, global hotkey (two pynput
+  listeners can get the process OS-aborted), and overlay.
+- **`src/tray.py`** — `pystray` menu-bar/tray front-end (cross-platform: macOS menu bar, Windows tray).
+  **The tray owns the main thread** (required for the macOS GUI run loop); the pynput hotkey listener +
+  recognizer stay on background threads. A watcher thread mirrors `app.running` onto the icon, so the
+  double-tap hotkey and the menu reflect the same state. `TrayController` is the GUI-free, unit-tested
+  glue; pystray/pillow imports are lazy.
+- **`src/autostart.py`** — login-item installer, one interface (`install`/`uninstall`/`status`) over
+  two backends: macOS = a launchd LaunchAgent (`RunAtLoad` + `KeepAlive={SuccessfulExit:false}`),
+  Windows = a Task Scheduler task (`LogonTrigger` + `RestartOnFailure` — the KeepAlive analog),
+  both running the `dum`/`dum.ps1` launcher + `--tray`. Linux (`systemd --user`) lands next phase.
+  The `build_plist_dict` / `build_task_xml` builders are pure and unit-tested.
 
-These three modules + their tests are **pure cross-platform logic and run on Linux/WSL**; only the
-launchd `launchctl` calls and the live menu-bar rendering need a Mac to exercise.
+The launch + hotkey + platform code is decomposed so its **pure logic is unit-tested and runs on
+Linux/WSL** (`test_single_instance`, `test_autostart` — both plist and Windows-task XML —, `test_tray`,
+`test_platform_dispatch`, `test_config`). Only the live OS calls (launchctl/schtasks, real menu-bar
+rendering, SendInput/win32 clipboard) need their actual OS to exercise.
 
 ### Vocabulary (`packs/*.aliases`)
 
